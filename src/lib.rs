@@ -1,5 +1,6 @@
 //! Public API for the chamaleon keyboard-layout switcher. Windows-only for now.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::{
@@ -53,6 +54,8 @@ impl KeyboardLayout {
 /// Errors returned by the chamaleon API.
 #[derive(Debug)]
 pub enum Error {
+    /// `KeyboardFilterBuilder::build` was called without setting `default_layout`.
+    MissingDefaultLayout,
     /// `CM_Register_Notification` returned a non-success `CONFIGRET`.
     RegisterFailed(CONFIGRET),
 }
@@ -60,6 +63,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingDefaultLayout => {
+                write!(f, "default_layout must be set before calling build")
+            }
             Self::RegisterFailed(cr) => write!(f, "CM_Register_Notification failed: {cr:?}"),
         }
     }
@@ -70,16 +76,15 @@ impl std::error::Error for Error {}
 /// Watches PnP keyboard connect/disconnect events and switches the active layout.
 pub struct KeyboardFilter {
     default_layout: KeyboardLayout,
-    on_connect: Option<KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardLayout>,
 }
 
 impl KeyboardFilter {
-    /// Start a builder. `default_layout` is the layout applied whenever no external
-    /// PnP keyboard is connected.
-    pub fn builder(default_layout: KeyboardLayout) -> KeyboardFilterBuilder {
+    /// Start a builder. `default_layout` must be set before `build`.
+    pub fn builder() -> KeyboardFilterBuilder {
         KeyboardFilterBuilder {
-            default_layout,
-            on_connect: None,
+            default_layout: None,
+            on_connect: HashMap::new(),
         }
     }
 
@@ -87,16 +92,26 @@ impl KeyboardFilter {
         &self.default_layout
     }
 
-    pub fn on_connect(&self) -> Option<&KeyboardLayout> {
-        self.on_connect.as_ref()
+    pub fn on_connect(&self) -> &HashMap<String, KeyboardLayout> {
+        &self.on_connect
     }
 
     /// Subscribe to keyboard PnP events. The returned [`Watcher`] keeps the
     /// subscription alive; drop it to stop.
     pub fn watch(&self) -> Result<Watcher, Error> {
-        if !any_keyboard_present() {
-            tracing::info!("no keyboard present at startup, applying default layout");
-            switch_layout(self.default_layout.klid());
+        let present = present_keyboard_ids();
+        match present.iter().find_map(|id| self.on_connect.get(id)) {
+            Some(layout) => {
+                tracing::info!(
+                    klid = layout.klid(),
+                    "configured keyboard present at startup"
+                );
+                switch_layout(layout.klid());
+            }
+            None => {
+                tracing::info!("no configured keyboard present at startup, applying default");
+                switch_layout(self.default_layout.klid());
+            }
         }
 
         let state = Box::new(WatchState {
@@ -132,22 +147,32 @@ impl KeyboardFilter {
 }
 
 pub struct KeyboardFilterBuilder {
-    default_layout: KeyboardLayout,
-    on_connect: Option<KeyboardLayout>,
+    default_layout: Option<KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardLayout>,
 }
 
 impl KeyboardFilterBuilder {
-    /// Layout applied when an external PnP keyboard is connected.
-    pub fn on_connect(mut self, layout: KeyboardLayout) -> Self {
-        self.on_connect = Some(layout);
+    /// Layout applied when no configured keyboard is present (startup with no
+    /// keyboard, or any disconnect). Required.
+    pub fn default_layout(mut self, layout: KeyboardLayout) -> Self {
+        self.default_layout = Some(layout);
         self
     }
 
-    pub fn build(self) -> KeyboardFilter {
-        KeyboardFilter {
-            default_layout: self.default_layout,
+    /// Register a layout to apply when the keyboard with the given identifier
+    /// connects. The identifier is the `VID_xxxx&PID_xxxx` substring of the
+    /// device's symbolic link, e.g. `"VID_258A&PID_002A"` (case-insensitive).
+    /// Call multiple times to configure several keyboards.
+    pub fn on_connect(mut self, id: impl Into<String>, layout: KeyboardLayout) -> Self {
+        self.on_connect.insert(id.into().to_ascii_uppercase(), layout);
+        self
+    }
+
+    pub fn build(self) -> Result<KeyboardFilter, Error> {
+        Ok(KeyboardFilter {
+            default_layout: self.default_layout.ok_or(Error::MissingDefaultLayout)?,
             on_connect: self.on_connect,
-        }
+        })
     }
 }
 
@@ -167,7 +192,7 @@ impl Drop for Watcher {
 
 struct WatchState {
     default_layout: KeyboardLayout,
-    on_connect: Option<KeyboardLayout>,
+    on_connect: HashMap<String, KeyboardLayout>,
 }
 
 unsafe extern "system" fn notify_callback(
@@ -182,9 +207,11 @@ unsafe extern "system" fn notify_callback(
 
     match action {
         CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL => {
-            tracing::info!(device = %device, "keyboard connected");
-            if let Some(layout) = &state.on_connect {
-                switch_layout(layout.klid());
+            let key = device_key(&device);
+            tracing::info!(device = %device, id = %key, "keyboard connected");
+            match state.on_connect.get(&key) {
+                Some(layout) => switch_layout(layout.klid()),
+                None => tracing::info!(id = %key, "keyboard has no configuration"),
             }
         }
         CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL => {
@@ -194,6 +221,19 @@ unsafe extern "system" fn notify_callback(
         _ => {}
     }
     0 // ERROR_SUCCESS
+}
+
+// VID/PID extracted from a HID symbolic link, uppercased for case-insensitive
+// matching against the user-supplied identifiers in `on_connect`.
+fn device_key(symlink: &str) -> String {
+    let upper = symlink.to_ascii_uppercase();
+    if let Some(idx) = upper.find("VID_") {
+        let tail = &upper[idx..];
+        if tail.len() >= 17 {
+            return tail[..17].to_string();
+        }
+    }
+    upper
 }
 
 // SymbolicLink is a variable-length wide string laid out past the struct's
@@ -213,10 +253,10 @@ unsafe fn device_symbolic_link(event_data: *const CM_NOTIFY_EVENT_DATA) -> Strin
     }
 }
 
-// Returns true if at least one device interface for the keyboard class is
-// currently present. The size API returns 1 (just the multi-string terminator)
-// when the list is empty, so anything greater means at least one device.
-fn any_keyboard_present() -> bool {
+// Enumerate all currently-present keyboard device interfaces and return their
+// `VID_xxxx&PID_xxxx` identifiers. The list API returns a multi-sz wide buffer:
+// null-terminated strings back-to-back, ending with an extra empty string.
+fn present_keyboard_ids() -> Vec<String> {
     unsafe {
         let mut len: u32 = 0;
         let cr = CM_Get_Device_Interface_List_SizeW(
@@ -225,7 +265,34 @@ fn any_keyboard_present() -> bool {
             PCWSTR::null(),
             CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
         );
-        cr == CR_SUCCESS && len > 1
+        if cr != CR_SUCCESS || len <= 1 {
+            return Vec::new();
+        }
+
+        let mut buffer = vec![0u16; len as usize];
+        let cr = CM_Get_Device_Interface_ListW(
+            &GUID_DEVINTERFACE_KEYBOARD,
+            PCWSTR::null(),
+            &mut buffer,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+        );
+        if cr != CR_SUCCESS {
+            return Vec::new();
+        }
+
+        let mut ids = Vec::new();
+        let mut start = 0usize;
+        for i in 0..buffer.len() {
+            if buffer[i] == 0 {
+                if i == start {
+                    break;
+                }
+                let symlink = String::from_utf16_lossy(&buffer[start..i]);
+                ids.push(device_key(&symlink));
+                start = i + 1;
+            }
+        }
+        ids
     }
 }
 
